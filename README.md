@@ -3,7 +3,7 @@ This is a maintained fork of the Chia Log Analyzer, updated to work with the lat
 
 Simply realtime chia log analyzer
 
-![Screenshot](https://user-images.githubusercontent.com/123456/placeholder.png)
+![Screenshot](https://github.com/DannKenn/chia-log-analyzer/blob/main/v2.PNG)
 
 ## What's New
 - **Standalone Executable**: No external dependencies required. Just download and run.
@@ -60,3 +60,4 @@ Automatically trying to load `debug.log` from these locations:
 
 ## Keys
 - `q` - exit
+
