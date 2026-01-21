@@ -1,18 +1,12 @@
-// Copyright 2021 Michal Kubec <michal.kubec@gmail.com>. All rights reserved.
-// Use of this source code is governed by a MIT license that can
-// be found in the LICENSE file.
-
-// +build ignore
-
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/user"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -21,593 +15,144 @@ import (
 
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
-	log "github.com/sirupsen/logrus"
 )
 
 var debuglogFile = flag.String("log", "./debug.log", "path to debug.log")
-
-var widgetLastTimestamp *widgets.Paragraph
-var widgetLastPlots *widgets.Paragraph
-var widgetFoundProofs *widgets.Paragraph
-var widgetLastFarmingTime *widgets.Paragraph
-var widgetTotalFarmingPlotsNumber *widgets.Paragraph
-var widgetLog *widgets.Paragraph
+var widgetLastPlots, widgetFoundProofs, widgetLastFarmingTime, widgetTotalFarmingPlotsNumber, widgetLog *widgets.Paragraph
 var widgetBarChart *widgets.BarChart
-var widgetBarChartParagraph *widgets.Paragraph
 var widgetBarChart2 *widgets.Plot
-var widgetBarChart2Paragraph *widgets.Paragraph
 var widgetSparklines *widgets.Sparkline
 var widgetSparklinesGroup *widgets.SparklineGroup
 var widgetOverallHealthPercent *widgets.Paragraph
 var lastRow string = ""
-var lastParsedLines []string
-
-var farmingPlotsNumber = 0
-var totalFarmingPlotsNumber = "0"
-
-var totalFarmingAttempt = 0
-var positiveFarmingAttempt = 0
-
-var foundProofs = 0
-var farmingTime = "0"
-var totalPlots = "0"
-var minFarmingTime = 999999.0
-var maxFarmingTime = 0.0
+var totalFarmingAttempt, positiveFarmingAttempt, foundProofs int = 0, 0, 0
+var farmingTime, totalPlots string = "0", "0"
+var minFarmingTime, maxFarmingTime float64 = 999999.0, 0.0
 var allFarmingTimes []float64
-
-var lastLogFileSize = int64(0)
+var lastLogFileSize int64 = 0
 var healthData = make(map[string]float64)
 
-type stackStruct struct {
-	lines []string
-	count int
-}
+type stackStruct struct { lines []string; count int }
+type stackStructFloats struct { values []float64; count int }
+type poolInfoStruct struct { name string; partialsCount int }
 
-type stackStructFloats struct {
-	values []float64
-	count  int
-}
-
-type poolInfoStruct struct {
-	name          string
-	partialsCount int
-}
-
-// keep only X last lines in buffer
-func (stack *stackStruct) push(line string) {
-	stack.lines = append(stack.lines, line)
-	if len(stack.lines) > stack.count {
-		stack.lines = stack.lines[1 : stack.count+1]
-	}
-}
-
-// keep only X last values in buffer
-func (stack *stackStructFloats) push(value float64) {
-	stack.values = append(stack.values, value)
-	if len(stack.values) > stack.count {
-		stack.values = stack.values[1 : stack.count+1]
-	}
-}
+func (s *stackStruct) push(l string) { s.lines = append(s.lines, l); if len(s.lines) > s.count { s.lines = s.lines[1:] } }
+func (s *stackStructFloats) push(v float64) { s.values = append(s.values, v); if len(s.values) > s.count { s.values = s.values[1:] } }
 
 var lastParsedLinesStack = stackStruct{count: 5}
 var lastFarmStack = stackStructFloats{count: 29}
 var lastFarmingTimesStack = stackStructFloats{count: 113}
-
 var poolInfo = poolInfoStruct{partialsCount: 0}
 
-var GitCommit string //string is written during the build proces
-
 func main() {
-
-	initLogging()
 	detectLogFileLocation()
-
-	if err := ui.Init(); err != nil {
-		log.Fatalf("failed to initialize termui: %v", err)
-	}
-	defer ui.Close()
-
-	var smallWidgetHeight = 3
-
-	widgetLastPlots = widgets.NewParagraph()
-	widgetLastPlots.SetRect(0, 0, 9, smallWidgetHeight)
-	widgetLastPlots.Title = "Plots"
-	ui.Render(widgetLastPlots)
-
-	widgetFoundProofs = widgets.NewParagraph()
-	widgetFoundProofs.SetRect(9, 0, 46, smallWidgetHeight)
-	widgetFoundProofs.Title = "Proofs / Pool partials"
-	ui.Render(widgetFoundProofs)
-
-	widgetTotalFarmingPlotsNumber = widgets.NewParagraph()
-	widgetTotalFarmingPlotsNumber.SetRect(46, 0, 68, smallWidgetHeight)
-	widgetTotalFarmingPlotsNumber.Title = "Farming attempts"
-	ui.Render(widgetTotalFarmingPlotsNumber)
-
-	widgetLastFarmingTime = widgets.NewParagraph()
-	widgetLastFarmingTime.SetRect(68, 0, 109, smallWidgetHeight)
-	widgetLastFarmingTime.Title = "Farming times (last/min/avg/max)"
-	ui.Render(widgetLastFarmingTime)
-
-	widgetOverallHealthPercent = widgets.NewParagraph()
-	widgetOverallHealthPercent.Title = "Health"
-	widgetOverallHealthPercent.SetRect(109, 0, 119, smallWidgetHeight)
-	widgetOverallHealthPercent.TextStyle.Fg = ui.ColorCyan
-	widgetOverallHealthPercent.Text = "?? %"
-
-	widgetLog = widgets.NewParagraph()
-	widgetLog.SetRect(0, 15, 119, smallWidgetHeight)
-	widgetLog.Title = "Last farming"
-	ui.Render(widgetLog)
-
-	widgetBarChart = widgets.NewBarChart()
-	widgetBarChart.Title = "Plots eligible for farming - last 59 values"
-	widgetBarChart.SetRect(0, 15, 119, 25)
-	widgetBarChart.BarWidth = 3
-	widgetBarChart.BarGap = 1
-	widgetBarChart.BarColors = []ui.Color{ui.ColorGreen}
-	widgetBarChart.LabelStyles = []ui.Style{ui.NewStyle(ui.ColorBlue)}
-	widgetBarChart.NumStyles = []ui.Style{ui.NewStyle(ui.ColorWhite)}
-
-	//widget for "not enough data"
-	widgetBarChartParagraph = widgets.NewParagraph()
-	widgetBarChartParagraph.SetRect(0, 15, 119, 25) //same as above
-	widgetBarChartParagraph.Title = "Not engough data or zero values"
-
-	widgetBarChart2 = widgets.NewPlot()
-	widgetBarChart2.Title = "Farming times (axis Y in seconds) - last 113 values"
-	widgetBarChart2.Data = make([][]float64, 1)
-	widgetBarChart2.SetRect(0, 25, 119, 35)
-	widgetBarChart2.AxesColor = ui.ColorWhite
-	widgetBarChart2.LineColors[0] = ui.ColorRed
-	widgetBarChart2.Marker = widgets.MarkerBraille
-
-	//widget for "not enough data"
-	widgetBarChart2Paragraph = widgets.NewParagraph()
-	widgetBarChart2Paragraph.SetRect(0, 25, 119, 35) //same as above
-	widgetBarChart2Paragraph.Title = "Not engough data or zero values"
-
-	widgetSparklines = widgets.NewSparkline()
-	widgetSparklines.Title = "1 col = 10 minutes block. It could be about 64 reqs/ 10minutes. Chart could be almost flat (+/-1 height block)"
-	widgetSparklines.LineColor = ui.ColorBlue
-	widgetSparklines.TitleStyle.Fg = ui.ColorWhite
-
-	widgetSparklinesGroup = widgets.NewSparklineGroup(widgetSparklines)
-	widgetSparklinesGroup.Title = "Health indicator - number of incoming farming requests from the Chia network"
-	widgetSparklinesGroup.SetRect(0, 35, 119, 45)
-
+	if err := ui.Init(); err != nil { panic(err) }; defer ui.Close()
+	setupWidgets()
 	go loopReadFile()
-
-	uiEvents := ui.PollEvents()
-	for {
-		e := <-uiEvents
-		switch e.ID {
-		case "q", "<C-c>":
-			return
-		}
-	}
-
-}
-
-func initLogging() {
-	writeLog := flag.Bool("writelog", false, "write log?")
-	flag.Parse()
-	if *writeLog {
-		// If the file doesn't exist, create it or append to the file
-		file, err := os.OpenFile("chia-log-analyzer.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.SetOutput(file)
-	} else {
-		log.SetOutput(ioutil.Discard)
-	}
-
-	log.SetLevel(log.InfoLevel)
-	log.SetFormatter(&log.TextFormatter{
-		DisableColors: true,
-		FullTimestamp: true,
-	})
-	log.Info("Application start")
-}
-
-func detectLogFileLocation() {
-	flag.Parse()
-	missingLogFile := false
-
-	//1 - try open debug.log in the actual directory or get file from the paremeter "log"
-	log.Info(fmt.Sprintf("Trying to open: %s", *debuglogFile))
-	if _, err := os.Stat(*debuglogFile); os.IsNotExist(err) {
-		missingLogFile = true
-	} else {
-		return
-	}
-
-	//2 - try open debug log from the default home location
-	usr, _ := user.Current()
-	dir := usr.HomeDir
-	defaultLogLocation := fmt.Sprintf("%s/.chia/mainnet/log/debug.log", dir)
-	debuglogFile = &defaultLogLocation
-	log.Info(fmt.Sprintf("Trying to open: %s", *debuglogFile))
-	if _, err := os.Stat(*debuglogFile); os.IsNotExist(err) {
-		missingLogFile = true
-	} else {
-		return
-	}
-
-	if missingLogFile == true {
-		fmt.Println("Please specify path to the log file, with parameter: log (--log=/path/to/debug.log)")
-		os.Exit(0)
-	}
-}
-
-func loopReadFile() {
-	renderLog(fmt.Sprintf("Reading log %s, please wait", *debuglogFile))
-	readFullFile(*debuglogFile)
-	setLastLogFileSize(*debuglogFile)
-
-	c := time.Tick(5 * time.Second)
-	var actualLogFileSize int64
-	for range c {
-		actualLogFileSize, _ = getFileSize(*debuglogFile)
-		log.Info(fmt.Sprintf("Actual log file size: %d bytes", actualLogFileSize))
-		if actualLogFileSize == 0 || actualLogFileSize == lastLogFileSize {
-			log.Info("No file change, skipping parsing")
-			continue
-		}
-		if actualLogFileSize < lastLogFileSize { // new file ?
-			log.Info("New file detected")
-			readFullFile(*debuglogFile)
-		} else {
-			readFile(*debuglogFile)
-		}
-
-		setLastLogFileSize(*debuglogFile)
-	}
-}
-
-func setLastLogFileSize(filepath string) {
-	lastLogFileSize, _ = getFileSize(filepath)
-	log.Info(fmt.Sprintf("Last file size: %d bytes", lastLogFileSize))
-}
-
-func getFileSize(filepath string) (int64, error) {
-	fi, err := os.Stat(filepath)
-	if err != nil {
-		return 0, err
-	}
-	// get the size
-	return fi.Size(), nil
-}
-
-func readFullFile(fname string) {
-	if _, err := os.Stat(fname); os.IsNotExist(err) {
-		return
-	}
-
-	log.Info("Reading full file")
-	lastRow = ""
-
-	// os.Open() opens specific file in
-	// read-only mode and this return
-	// a pointer of type os.
-	file, err := os.Open(fname)
-
-	if err != nil {
-		log.Error(fmt.Sprintf("Failed to open log file: %s, skipping reading", fname))
-		return
-	}
-	defer file.Close()
-
-	// The bufio.NewScanner() function is called in which the
-	// object os.File passed as its parameter and this returns a
-	// object bufio.Scanner which is further used on the
-	// bufio.Scanner.Split() method.
-	scanner := bufio.NewScanner(file)
-
-	// The bufio.ScanLines is used as an
-	// input to the method bufio.Scanner.Split()
-	// and then the scanning forwards to each
-	// new line using the bufio.Scanner.Scan()
-	// method.
-	scanner.Split(bufio.ScanLines)
-	var text []string
-
-	for scanner.Scan() {
-		text = append(text, scanner.Text())
-	}
-
-	parseLines(text)
-
-	// The method os.File.Close() is called
-	// on the os.File object to close the file
-	file.Close()
-}
-
-func readFile(fname string) {
-	if _, err := os.Stat(fname); os.IsNotExist(err) {
-		log.Error(fmt.Sprintf("Failed to open log file: %s, skipping reading", fname))
-		return
-	}
-
-	file, err := os.Open(fname)
-	if err != nil {
-		log.Error(fmt.Sprintf("Failed to open log file: %s, skipping reading", err))
-		return
-	}
-	defer file.Close()
-
-	bytesToRead := 16384
-
-	buf := make([]byte, bytesToRead)
-	stat, err := os.Stat(fname)
-	start := int64(0)
-
-	if stat.Size() > 0 { //not empty file
-		//is file big enough ?
-		if stat.Size() >= int64(bytesToRead) {
-			start = stat.Size() - int64(bytesToRead)
-		} else {
-			buf = make([]byte, stat.Size())
-		}
-
-		log.Info(fmt.Sprintf("Reading file. %d bytes from the position: %d", len(buf), start))
-
-		_, err = file.ReadAt(buf, start)
-		if err == nil {
-			lines := strings.Split(strings.ReplaceAll(string(buf), "\r\n", "\n"), "\n")
-			parseLines(lines)
-		} else {
-			log.Error(fmt.Sprintf("Error when reading bytes from log file: %s", err))
-		}
-	}
-
-	file.Close()
+	for e := range ui.PollEvents() { if e.ID == "q" || e.ID == "<C-c>" { return } }
 }
 
 func parseLines(lines []string) {
-	log.Info(fmt.Sprintf("Number of rows for parsing: %d", len(lines)))
+	// 2.5.7 FORMATINA OZEL REGEX: 'Found 1 V1 proofs' ve 'Found 0 proofs' kalıplarını yakalar.
+	rePlots := regexp.MustCompile(`(\d+)\s+plots\s+were\s+eligible.*Found\s+(\d+)\s+(?:V\d+\s+)?proofs.*Time:\s+([0-9\.]+)\s+s.*Total\s+(\d+)\s+plots`)
+	rePool := regexp.MustCompile(`Submitting\s+partial.*to\s+(https?://\S+)`)
+	reTime := regexp.MustCompile(`(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})`)
 
-	//0 plots were eligible for farming 27274481c3... Found 0 proofs. Time: 0.14447 s. Total 105 plots
-	regexPlotsFarming, _ := regexp.Compile("([0-9]+)\\s+plots\\s+were\\seligible.*Found\\s([0-9])+\\sproofs.*Time:\\s([0-9]+\\.[0-9]+)\\ss\\.\\sTotal\\s([0-9]+)\\splots")
-
-	//Submitting partial for 111111111111111111 to https://xxx.xxx.com
-	regexSubmittingPartials, _ := regexp.Compile("Submitting\\s+partial\\s+for\\s+([0-9a-f]+)\\s+to\\s+(https://.*)")
-
-	startParsingLines := false
-	for i, s := range lines {
-		//log.Info(fmt.Sprintf("Last row: %s", lastRow))
-		if i == 0 { //skip the first row - can be uncomplete due reading by bytes
-			continue
-		}
-		if s == "" {
-			continue
-		}
-		if !startParsingLines {
-			if lastRow == "" { //first run ?
-				startParsingLines = true
-			} else {
-				if lastRow == s {
-					startParsingLines = true
-				}
-				continue
-			}
-		}
-
+	start := false
+	for _, s := range lines {
+		if s == "" { continue }
+		if !start { if lastRow == "" || lastRow == s { start = true }; continue }
 		lastRow = s
-		//log.Info(fmt.Sprintf("Last row2: %s", lastRow))
-
-		if regexPlotsFarming.MatchString(s) {
+		if rePlots.MatchString(s) {
 			lastParsedLinesStack.push(s)
-
-			//extract number of requests in 10minutes blocks
-			runes := []rune(s)
-			dateTime := string(runes[0:15]) //1 or 10-minutes (15=10min, 16=1min)
-			_, exists := healthData[dateTime]
-			if !exists {
-				healthData[dateTime] = 0
+			if t := reTime.FindString(s); t != "" { healthData[t[0:15]]++ }
+			m := rePlots.FindStringSubmatch(s)
+			if len(m) >= 5 {
+				eligible, _ := strconv.Atoi(m[1])
+				proofs, _ := strconv.Atoi(m[2])
+				fTime, _ := strconv.ParseFloat(m[3], 64)
+				foundProofs += proofs
+				farmingTime, totalPlots = m[3], m[4]
+				if eligible > 0 { positiveFarmingAttempt += eligible }
+				totalFarmingAttempt++
+				lastFarmStack.push(float64(eligible))
+				lastFarmingTimesStack.push(fTime)
+				allFarmingTimes = append(allFarmingTimes, fTime)
+				if fTime < minFarmingTime { minFarmingTime = fTime }
+				if fTime > maxFarmingTime { maxFarmingTime = fTime }
 			}
-			healthData[dateTime] = healthData[dateTime] + 1
-
-			//plots + proofs
-			match := regexPlotsFarming.FindStringSubmatch(s)
-			farmingPlotsNumber, _ := strconv.Atoi(match[1])
-			foundProofsActual, _ := strconv.Atoi(match[2])
-			if foundProofsActual > 0 {
-				foundProofs = foundProofs + foundProofsActual
-			}
-			farmingTime = match[3]
-			totalPlots = match[4]
-
-			if farmingPlotsNumber > 0 {
-				positiveFarmingAttempt = positiveFarmingAttempt + farmingPlotsNumber
-			}
-			totalFarmingAttempt++
-			lastFarmStack.push(float64(farmingPlotsNumber)) //data for barchart
-
-			parsedTime, _ := strconv.ParseFloat(farmingTime, 8) //last time
-
-			allFarmingTimes = append(allFarmingTimes, parsedTime) //for AVG computing
-
-			if parsedTime < float64(minFarmingTime) {
-				minFarmingTime = parsedTime
-			}
-			if parsedTime > float64(maxFarmingTime) {
-				maxFarmingTime = parsedTime
-			}
-			lastFarmingTimesStack.push(parsedTime)
 		}
-
-		if regexSubmittingPartials.MatchString(s) {
-			match := regexSubmittingPartials.FindStringSubmatch(s)
-			poolInfo.name = match[2]
-			poolInfo.partialsCount++
-			log.Info(poolInfo)
+		if rePool.MatchString(s) {
+			m := rePool.FindStringSubmatch(s)
+			if len(m) > 1 { poolInfo.name, poolInfo.partialsCount = m[1], poolInfo.partialsCount+1 }
 		}
 	}
-
-	log.Info("Log parsing done")
-
-	renderWidgets()
-	renderLastFarmBarChart()
-	renderLastFarmBarChart2()
-	renderSparkLines()
-
-	var tmpTxt strings.Builder
-	for i := range lastParsedLinesStack.lines {
-		twoCols := strings.Split(lastParsedLinesStack.lines[i], "    ")
-		tmpTxt.WriteString(twoCols[0])
-		tmpTxt.WriteString("\n")
-		tmpTxt.WriteString("-->")
-		tmpTxt.WriteString(twoCols[1])
-		tmpTxt.WriteString("\n")
-	}
-	renderLog(tmpTxt.String())
+	renderAll()
 }
 
-func renderWidgets() {
-	renderOverallHealth()
-	renderTotalFarmingPlotsNumber()
-	renderLastPlots()
-	renderFoundProofs()
-	renderLastFarmingTime()
+func setupWidgets() {
+	h := 3
+	widgetLastPlots = widgets.NewParagraph(); widgetLastPlots.Title = "Plots"; widgetLastPlots.SetRect(0, 0, 10, h)
+	widgetFoundProofs = widgets.NewParagraph(); widgetFoundProofs.Title = "Proofs/Pool"; widgetFoundProofs.SetRect(10, 0, 45, h)
+	widgetTotalFarmingPlotsNumber = widgets.NewParagraph(); widgetTotalFarmingPlotsNumber.Title = "Attempts"; widgetTotalFarmingPlotsNumber.SetRect(45, 0, 70, h)
+	widgetLastFarmingTime = widgets.NewParagraph(); widgetLastFarmingTime.Title = "Times (L/Min/Avg/Max)"; widgetLastFarmingTime.SetRect(70, 0, 105, h)
+	widgetOverallHealthPercent = widgets.NewParagraph(); widgetOverallHealthPercent.Title = "Health"; widgetOverallHealthPercent.SetRect(105, 0, 119, h)
+	widgetLog = widgets.NewParagraph(); widgetLog.Title = "Last Activity"; widgetLog.SetRect(0, 3, 119, 12)
+	widgetBarChart = widgets.NewBarChart(); widgetBarChart.Title = "Eligible Plots"; widgetBarChart.SetRect(0, 12, 119, 22); widgetBarChart.BarWidth = 3; widgetBarChart.BarColors = []ui.Color{ui.ColorGreen}
+	widgetBarChart2 = widgets.NewPlot(); widgetBarChart2.Title = "Latency (s)"; widgetBarChart2.SetRect(0, 22, 119, 32); widgetBarChart2.Data = make([][]float64, 1); widgetBarChart2.LineColors[0] = ui.ColorRed
+	widgetSparklines = widgets.NewSparkline(); widgetSparklines.LineColor = ui.ColorBlue
+	widgetSparklinesGroup = widgets.NewSparklineGroup(widgetSparklines); widgetSparklinesGroup.Title = "Network Health"; widgetSparklinesGroup.SetRect(0, 32, 119, 40)
 }
 
-func renderTotalFarmingPlotsNumber() {
-	percent := 0.0
-	if totalFarmingAttempt > 0 {
-		percent = float64(float64(positiveFarmingAttempt)/float64(totalFarmingAttempt)) * 100
+func renderAll() {
+	p := 0.0; if totalFarmingAttempt > 0 { p = float64(positiveFarmingAttempt) / float64(totalFarmingAttempt) * 100 }
+	widgetTotalFarmingPlotsNumber.Text = fmt.Sprintf("%d/%d(%.1f%%)", positiveFarmingAttempt, totalFarmingAttempt, p)
+	widgetLastPlots.Text = totalPlots
+	pT := fmt.Sprintf("%d/%d", foundProofs, poolInfo.partialsCount); if poolInfo.partialsCount > 0 { pT += " (" + poolInfo.name + ")" }; widgetFoundProofs.Text = pT
+	avg := 0.0; if len(allFarmingTimes) > 0 { sum := 0.0; for _, v := range allFarmingTimes { sum += v }; avg = sum / float64(len(allFarmingTimes)) }
+	widgetLastFarmingTime.Text = fmt.Sprintf("%ss/%.3fs/%.3fs/%.3fs", farmingTime, minFarmingTime, avg, maxFarmingTime)
+	if len(healthData) >= 3 {
+		v := sortMap(healthData); v = v[1 : len(v)-1]; hP := (sumFloats(v) / float64(len(v))) / 64 * 100
+		widgetOverallHealthPercent.Text = fmt.Sprintf("%.2f%%", hP)
+		if hP > 90 { widgetOverallHealthPercent.TextStyle.Fg = ui.ColorGreen } else { widgetOverallHealthPercent.TextStyle.Fg = ui.ColorRed }
 	}
-	widgetTotalFarmingPlotsNumber.Text = fmt.Sprintf("%d/%d(%.1f%%)", positiveFarmingAttempt, totalFarmingAttempt, percent)
-	ui.Render(widgetTotalFarmingPlotsNumber)
+	var sb strings.Builder
+	for _, l := range lastParsedLinesStack.lines {
+		msg := l; if i := strings.LastIndex(l, "INFO"); i != -1 { msg = l[i+4:] }; sb.WriteString(strings.TrimSpace(msg) + "\n")
+	}
+	widgetLog.Text = sb.String()
+	widgetBarChart.Data = lastFarmStack.values
+	widgetBarChart2.Data[0] = lastFarmingTimesStack.values
+	vS := sortMap(healthData); if len(vS) > 117 { vS = vS[len(vS)-117:] }; widgetSparklines.Data = vS
+	ui.Render(widgetLastPlots, widgetFoundProofs, widgetTotalFarmingPlotsNumber, widgetLastFarmingTime, widgetOverallHealthPercent, widgetLog, widgetBarChart, widgetBarChart2, widgetSparklinesGroup)
 }
 
-func renderLastPlots() {
-	widgetLastPlots.Text = fmt.Sprintf("%s", totalPlots)
-	ui.Render(widgetLastPlots)
+func detectLogFileLocation() {
+	if _, err := os.Stat(*debuglogFile); err == nil { return }
+	u, _ := user.Current(); d := filepath.Join(u.HomeDir, ".chia", "mainnet", "log", "debug.log")
+	debuglogFile = &d
 }
 
-func renderFoundProofs() {
-	if poolInfo.partialsCount > 0 {
-		widgetFoundProofs.Text = fmt.Sprintf("%d/%d (%s)", foundProofs, poolInfo.partialsCount, poolInfo.name)
-	} else {
-		widgetFoundProofs.Text = fmt.Sprintf("%d/%d", foundProofs, 0)
+func loopReadFile() {
+	readFullFile(*debuglogFile); setLastLogFileSize(*debuglogFile)
+	for range time.Tick(5 * time.Second) {
+		s, _ := getFileSize(*debuglogFile); if s == 0 || s == lastLogFileSize { continue }
+		if s < lastLogFileSize { readFullFile(*debuglogFile) } else { readFile(*debuglogFile) }; setLastLogFileSize(*debuglogFile)
 	}
-	ui.Render(widgetFoundProofs)
 }
 
-func renderLastFarmingTime() {
-	total := 0.0
-	for _, number := range allFarmingTimes {
-		total = total + number
-	}
-	average := total / float64(len(allFarmingTimes))
-
-	widgetLastFarmingTime.Text = fmt.Sprintf("%ss / %.3fs / %.3fs / %.3fs", farmingTime, minFarmingTime, average, maxFarmingTime)
-	ui.Render(widgetLastFarmingTime)
-}
-
-func renderLog(text string) {
-	widgetLog.Text = fmt.Sprintf("%s", text)
-	ui.Render(widgetLog)
-}
-
-func renderOverallHealth() {
-	if len(healthData) < 3 {
-		return
-	}
-	values := sortMap(healthData)
-	values = values[1 : len(values)-1] //remove the first and the last (may be incomplete)
-	sum := sumFloats(values)
-	avg := sum / float64(len(values))
-
-	//in chia network we can see 6.4 req/minute (64 req/10minutes) for farming
-	percent := avg / 64 * 100
-
-	/*
-		if percent > 100 { //result may be > 100%, but it is due some meassure inaccuracy
-			percent = 100 //overwrite down to 100% is OK
-		}*/
-
-	widgetOverallHealthPercent.TextStyle.Fg = ui.ColorRed
-	if percent > 80 {
-		widgetOverallHealthPercent.TextStyle.Fg = ui.ColorCyan
-	}
-	if percent > 95 {
-		widgetOverallHealthPercent.TextStyle.Fg = ui.ColorGreen
-	}
-	widgetOverallHealthPercent.Text = fmt.Sprintf("%.2f%%", percent)
-	ui.Render(widgetOverallHealthPercent)
-}
-
-func renderLastFarmBarChart() {
-	for _, x := range lastFarmStack.values {
-		if x > 0 { //at least one positive value
-			widgetBarChart.Data = lastFarmStack.values
-			ui.Render(widgetBarChart)
-			return
-		}
-	}
-
-	ui.Render(widgetBarChartParagraph)
-}
-
-func renderLastFarmBarChart2() {
-	for _, x := range lastFarmingTimesStack.values {
-		if x > 0 { //at least one positive value
-			widgetBarChart2.Data[0] = lastFarmingTimesStack.values
-			ui.Render(widgetBarChart2)
-			return
-		}
-	}
-
-	ui.Render(widgetBarChart2Paragraph)
-}
-
-func renderSparkLines() {
-
-	if len(healthData) == 0 {
-		return
-	}
-
-	v := sortMap(healthData)
-
-	sliceNumberOfValues := 117
-	if len(v) < sliceNumberOfValues {
-		sliceNumberOfValues = len(v)
-		v = v[len(v)-sliceNumberOfValues:]
-	}
-
-	widgetSparklines.Data = v
-	ui.Render(widgetSparklinesGroup)
+func setLastLogFileSize(p string) { lastLogFileSize, _ = getFileSize(p) }
+func getFileSize(p string) (int64, error) { fi, err := os.Stat(p); if err != nil { return 0, err }; return fi.Size(), nil }
+func readFullFile(f string) { b, _ := ioutil.ReadFile(f); lines := strings.Split(string(b), "\n"); parseLines(lines) }
+func readFile(f string) {
+	file, _ := os.Open(f); defer file.Close(); stat, _ := file.Stat(); start := int64(0)
+	if stat.Size() > 16384 { start = stat.Size() - 16384 }; buf := make([]byte, 16384); n, _ := file.ReadAt(buf, start)
+	lines := strings.Split(string(buf[:n]), "\n"); parseLines(lines)
 }
 
 func sortMap(m map[string]float64) []float64 {
-	if len(m) == 0 {
-		return make([]float64, 0)
-	}
-
-	v := make([]float64, 0, len(m))
-
-	//sort map by keys
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		v = append(v, m[k])
-	}
-
-	return v
+	keys := make([]string, 0, len(m)); for k := range m { keys = append(keys, k) }; sort.Strings(keys)
+	v := make([]float64, 0, len(m)); for _, k := range keys { v = append(v, m[k]) }; return v
 }
 
-func sumFloats(input []float64) float64 {
-	sum := 0.0
-
-	for i := range input {
-		sum += input[i]
-	}
-
-	return sum
-}
+func sumFloats(i []float64) float64 { s := 0.0; for _, v := range i { s += v }; return s }

@@ -1,7 +1,18 @@
-.idea
-.vscode
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
 *.log
+debug.log
+
+# Output binaries
 chia-log-analyzer
-builds
-*debug*
-sign-code
+chia-log-analyzer.go-linux-amd64
+chia-log-analyzer.go-windows-amd64.exe
+
+# IDEs
+.vscode/
+.idea/

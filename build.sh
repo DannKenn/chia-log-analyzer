@@ -1,32 +1,11 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-GIT_COMMIT=$(git rev-list -1 HEAD)
-echo 'Building GIT version:' $GIT_COMMIT
-package=chia-log-analyzer.go
-#package=$1
-#if [[ -z "$package" ]]; then
-#  echo "usage: $0 <package-name>"
-#  exit 1
-#fi
-package_split=(${package//\// })
-package_name=${package_split[-1]}
+# Build for Linux
+echo "Building for Linux..."
+go build -o chia-log-analyzer.go-linux-amd64 chia-log-analyzer.go
 
-platforms=("windows/amd64" "linux/amd64" "linux/arm" "darwin/amd64")
+# Build for Windows
+echo "Building for Windows..."
+GOOS=windows GOARCH=amd64 go build -o chia-log-analyzer.go-windows-amd64.exe chia-log-analyzer.go
 
-for platform in "${platforms[@]}"
-do
-    platform_split=(${platform//\// })
-    GOOS=${platform_split[0]}
-    GOARCH=${platform_split[1]}
-    output_name=$package_name'-'$GOOS'-'$GOARCH
-    if [ $GOOS = "windows" ]; then
-        output_name+='.exe'
-    fi
-    echo 'Building OS/ARCH: '$GOOS'/'$GOARCH
-    env GOOS=$GOOS GOARCH=$GOARCH go build -ldflags "-X main.GitCommit=$GIT_COMMIT" -o ./builds/$output_name $package
-    if [ $? -ne 0 ]; then
-        echo 'An error has occurred! Aborting the script execution...'
-        exit 1
-    fi
-done
-echo "Building done"
+echo "Build done."
